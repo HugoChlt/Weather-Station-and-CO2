@@ -4,164 +4,415 @@
 #include <SD.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <ScioSense_ENS160.h>
 
-// Paramètres du Wi-Fi
-const char* ssid = "Moi";          // Remplace par le nom de ton réseau Wi-Fi
-const char* password = "Montlays";  // Remplace par ton mot de passe Wi-Fi
+// Inclure le fichier de configuration (non versionné)
+#include "config.h"
 
-// Pin SD
-#define SD_CS_PIN 5  // CS de la carte SD (tu as mentionné GPIO5)
+WiFiUDP ntpUDP;                
+NTPClient timeClient(ntpUDP, ntp_server, ntp_offset, ntp_update_interval);  
 
-// Pins DHT
-#define DHTPIN 4        // Le pin GPIO auquel est connecté le DHT22
-#define DHTTYPE DHT22   // DHT22 (AM2302)
+DHT dht(DHTPIN, DHTTYPE);  
+Adafruit_AHTX0 aht;                 
+ScioSense_ENS160 ens160(ENS160_I2CADDR_1);
 
-// Pin LED
-#define LED_PIN 2       // Pin de la LED (GPIO 2)
+bool ledState = LOW;  
+bool wifiConnected = false;
+bool sdCardInitialized = false;
+bool ahtInitialized = false;
+bool ens160Initialized = false;
 
-#define TIME_SCALE 1
-
-WiFiUDP ntpUDP;                // Objet pour UDP pour NTP
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 7200, 60000);  // NTP avec 1 heure de décalage et mise à jour toutes les 60s
-
-DHT dht(DHTPIN, DHTTYPE);  // Initialise le capteur DHT
-
-bool ledState = LOW;  // État de la LED
+// Variables pour la gestion des erreurs I2C
+unsigned long lastI2CError = 0;
+int i2cErrorCount = 0;
 
 struct SensorData {
-  String currentTime;   // Heure actuelle
-  float temperature;    // Température
-  float humidity;       // Humidité
+  String date;         
+  String time;         
+  float temperatureDHT;
+  float humidityDHT;
+  float temperatureAHT;
+  float humidityAHT;
+  uint16_t eco2;
+  uint16_t tvoc;
+  uint8_t aqi;
 };
 
 void setup() {
-  // Initialisation de la communication série
   Serial.begin(115200);
-  delay(1000);  // Attends un peu pour que le moniteur série soit prêt
-
-  pinMode(LED_PIN, OUTPUT);
-
-  connect_wifi();
-
-  // Initialisation du client NTP pour récupérer l'heure
-  timeClient.begin();
-
-  // Initialisation du capteur DHT
-  dht.begin();
+  delay(2000);
   
+  Serial.println("=== DÉMARRAGE ESP32 ===");
+  
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  init_i2c();
+  init_wifi();
+  init_dht();
   init_sd_card();
+  init_sensors();
+  
+  Serial.println("=== SETUP TERMINÉ ===");
 }
 
 void loop() {
-  // Attend quelques secondes entre les lectures
-  delay(2000 * TIME_SCALE);
-
+  unsigned long startTime = millis();
+  
+  check_wifi_connection();
   led();
 
   SensorData datas;
-  datas.currentTime = catch_time();
-  datas.temperature = catch_temp();
-  datas.humidity = catch_hum();
+  String fullTime = catch_time();
+  datas.date = fullTime.substring(0, 10);
+  datas.time = fullTime.substring(11);
 
-  save_on_sd_card(datas);
+  read_all_sensors(datas);
+  
+  if (sdCardInitialized) {
+    save_on_sd_card(datas);
+    clean_old_files();
+  }
+  
+  monitor_i2c_health();
+  
+  unsigned long loopTime = millis() - startTime;
+  Serial.printf("Temps de loop: %lu ms\n", loopTime);
+  
+  delay(2000 * TIME_SCALE);
 }
 
-void connect_wifi(){
-  // Connexion Wi-Fi
+void init_i2c() {
+  Serial.println("Initialisation I2C...");
+  
+  Wire.end();
+  delay(100);
+  
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(I2C_FREQUENCY);
+  
+  delay(500);
+  Serial.println("I2C initialisé (100kHz)");
+}
+
+void init_wifi() {
+  Serial.println("Initialisation WiFi...");
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connexion au WiFi...");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < MAX_WIFI_RETRIES) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
   }
-  Serial.println("Connecté au WiFi !");
-  Serial.print("Adresse IP: ");
-  Serial.println(WiFi.localIP());
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\nWiFi connecté !");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    timeClient.begin();
+  } else {
+    wifiConnected = false;
+    Serial.println("\nWiFi non connecté - mode offline");
+  }
 }
 
-void init_sd_card(){
-  // Initialisation de la carte SD
-  if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("Échec de l'initialisation de la carte SD !");
-    return;
+void check_wifi_connection() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  
+  if (now - lastCheck > 30000) {
+    lastCheck = now;
+    
+    if (WiFi.status() != WL_CONNECTED && !wifiConnected) {
+      Serial.println("Tentative de reconnexion WiFi...");
+      WiFi.reconnect();
+      delay(1000);
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        timeClient.begin();
+        Serial.println("WiFi reconnecté !");
+      }
+    } else if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+      wifiConnected = false;
+      Serial.println("Connexion WiFi perdue");
+    }
   }
-  Serial.println("Carte SD initialisée.");
 }
 
-String catch_time(){
-  // Récupérer l'heure actuelle via NTP
-  timeClient.update();  // Met à jour l'heure
-  String currentTime = timeClient.getFormattedTime();
+void init_dht() {
+  Serial.println("Initialisation DHT22...");
+  dht.begin();
+  delay(2000);
+  Serial.println("DHT22 initialisé");
+}
 
-  Serial.print("Heure actuelle : ");
-  Serial.println(currentTime);
+void init_sd_card() {
+  Serial.println("Initialisation carte SD...");
+  if (SD.begin(SD_CS_PIN)) {
+    sdCardInitialized = true;
+    Serial.println("Carte SD initialisée");
+  } else {
+    sdCardInitialized = false;
+    Serial.println("Échec initialisation carte SD");
+  }
+}
 
+void init_sensors() {
+  Serial.println("Initialisation capteurs I2C...");
+  
+  scan_i2c();
+  
+  if (aht.begin()) {
+    ahtInitialized = true;
+    Serial.println("AHT21 détecté et initialisé");
+  } else {
+    ahtInitialized = false;
+    Serial.println("AHT21 non détecté");
+  }
+  
+  delay(1000);
+  
+  if (ens160.begin() && ens160.available()) {
+    ens160Initialized = true;
+    Serial.println("ENS160 détecté et initialisé");
+    Serial.printf("ENS160 Rev: %d.%d.%d\n", 
+                  ens160.getMajorRev(), 
+                  ens160.getMinorRev(), 
+                  ens160.getBuild());
+    
+    if (ens160.setMode(ENS160_OPMODE_STD)) {
+      Serial.println("ENS160 en mode standard");
+    } else {
+      Serial.println("Erreur mode standard ENS160");
+    }
+  } else {
+    ens160Initialized = false;
+    Serial.println("ENS160 non détecté");
+  }
+}
+
+void scan_i2c() {
+  Serial.println("Scan I2C...");
+  int deviceCount = 0;
+  
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.printf("Device trouvé à l'adresse 0x%02X\n", address);
+      deviceCount++;
+    }
+    delay(10);
+  }
+  
+  if (deviceCount == 0) {
+    Serial.println("Aucun device I2C trouvé");
+  } else {
+    Serial.printf("%d device(s) I2C trouvé(s)\n", deviceCount);
+  }
+}
+
+void read_all_sensors(SensorData &datas) {
+  datas.temperatureDHT = catch_temp();
+  datas.humidityDHT = catch_hum();
+  
+  delay(500);
+  
+  if (ahtInitialized) {
+    sensors_event_t humEvent, tempEvent;
+    if (aht.getEvent(&humEvent, &tempEvent)) {
+      datas.temperatureAHT = tempEvent.temperature;
+      datas.humidityAHT = humEvent.relative_humidity;
+      Serial.printf("AHT21 => T=%.2f°C, H=%.1f%%\n", 
+                    datas.temperatureAHT, datas.humidityAHT);
+    } else {
+      datas.temperatureAHT = -999.0;
+      datas.humidityAHT = -999.0;
+      Serial.println("Erreur lecture AHT21");
+      i2cErrorCount++;
+    }
+  } else {
+    datas.temperatureAHT = -999.0;
+    datas.humidityAHT = -999.0;
+  }
+  
+  delay(500);
+  
+  if (ens160Initialized) {
+    if (ens160.available()) {
+      ens160.measure(true);
+      ens160.measureRaw(true);
+      
+      datas.eco2 = ens160.geteCO2();
+      datas.tvoc = ens160.getTVOC();
+      datas.aqi = ens160.getAQI();
+      
+      if (datas.eco2 == 65535 || datas.tvoc == 65535) {
+        Serial.println("ENS160 données invalides");
+        datas.eco2 = 0;
+        datas.tvoc = 0;
+        datas.aqi = 0;
+        i2cErrorCount++;
+      } else {
+        Serial.printf("ENS160 => eCO2=%u ppm, TVOC=%u ppb, AQI=%u\n", 
+                      datas.eco2, datas.tvoc, datas.aqi);
+      }
+    } else {
+      Serial.println("ENS160 non disponible");
+      datas.eco2 = 0;
+      datas.tvoc = 0;
+      datas.aqi = 0;
+      i2cErrorCount++;
+    }
+  } else {
+    datas.eco2 = 0;
+    datas.tvoc = 0;
+    datas.aqi = 0;
+  }
+}
+
+void monitor_i2c_health() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  
+  if (now - lastCheck > 60000) {
+    lastCheck = now;
+    
+    if (i2cErrorCount > I2C_ERROR_THRESHOLD) {
+      Serial.printf("Trop d'erreurs I2C (%d), reinitialisation...\n", i2cErrorCount);
+      init_i2c();
+      delay(1000);
+      init_sensors();
+      i2cErrorCount = 0;
+    }
+  }
+}
+
+String catch_time() {
+  if (!wifiConnected) {
+    return "1970-01-01 00:00:00";
+  }
+  
+  int attempts = 0;
+  while (!timeClient.update() && attempts < 3) {
+    timeClient.forceUpdate();
+    delay(500);
+    attempts++;
+  }
+  
+  unsigned long epochTime = timeClient.getEpochTime();
+  
+  if (epochTime < 100000) {
+    return "1970-01-01 00:00:00";
+  }
+
+  time_t rawTime = (time_t) epochTime;
+  struct tm *ptm = gmtime(&rawTime);
+
+  char buffer[32];
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+          (ptm->tm_year+1900),
+          (ptm->tm_mon+1),
+          ptm->tm_mday,
+          ptm->tm_hour,
+          ptm->tm_min,
+          ptm->tm_sec);
+
+  String currentTime(buffer);
+  Serial.printf("Heure: %s\n", currentTime.c_str());
   return currentTime;
 }
 
-float catch_temp(){
+float catch_temp() {
   float temperature = dht.readTemperature();
-
-  // Vérifie si les lectures échouent
   if (isnan(temperature)) {
-    Serial.println("Échec de la lecture du capteur DHT !");
-    return -1.0;
+    Serial.println("Échec lecture température DHT22");
+    return -999.0;
   }
-
-  Serial.print("Température : ");
-  Serial.print(temperature);
-  Serial.print(" °C  ");
-
+  Serial.printf("DHT22 => T=%.2f°C\n", temperature);
   return temperature;
 }
 
-float catch_hum(){
+float catch_hum() {
   float humidity = dht.readHumidity();
-
-  // Vérifie si les lectures échouent
   if (isnan(humidity)) {
-    Serial.println("Échec de la lecture du capteur DHT !");
-    return -1.0;
+    Serial.println("Échec lecture humidité DHT22");
+    return -999.0;
   }
-
-  Serial.print("Humidité : ");
-  Serial.print(humidity);
-  Serial.println(" %");
-
+  Serial.printf("DHT22 => H=%.1f%%\n", humidity);
   return humidity;
 }
 
-void save_on_sd_card(SensorData datas){
-  // Crée/ouvre le fichier sur la carte SD en mode ajout (append)
-  File dataFile = SD.open("/donnees.txt", FILE_APPEND);
+void save_on_sd_card(SensorData datas) {
+  if (!sdCardInitialized) return;
+  
+  String filename = "/" + datas.date + ".csv";
+  bool newFile = !SD.exists(filename);
+
+  File dataFile = SD.open(filename, FILE_APPEND);
   if (dataFile) {
-    // Écrit la température, l'humidité et l'heure dans le fichier
-    dataFile.print("Heure: ");
-    dataFile.print(datas.currentTime);
-    dataFile.print(" Temp: ");
-    dataFile.print(datas.temperature);
-    dataFile.print(" °C Hum: ");
-    dataFile.print(datas.humidity);
-    dataFile.println(" %");
-    dataFile.close();  // Ferme le fichier
-    Serial.println("Données enregistrées sur la carte SD.");
+    if (newFile) {
+      dataFile.println("Date,Heure,Température_DHT,Humidité_DHT,Température_AHT,Humidité_AHT,eCO2,TVOC,AQI");
+    }
+    dataFile.printf("%s,%s,%.2f,%.1f,%.2f,%.1f,%u,%u,%u\n",
+                    datas.date.c_str(),
+                    datas.time.c_str(),
+                    datas.temperatureDHT,
+                    datas.humidityDHT,
+                    datas.temperatureAHT,
+                    datas.humidityAHT,
+                    datas.eco2,
+                    datas.tvoc,
+                    datas.aqi);
+    
+    dataFile.close();
+    Serial.println("Données sauvées: " + filename);
   } else {
-    Serial.println("Erreur d'ouverture du fichier.");
+    Serial.println("Erreur ouverture fichier SD");
   }
 }
 
-// void read_sd_card(){
+void clean_old_files() {
+  if (!wifiConnected || !sdCardInitialized) return;
+  
+  timeClient.update();
+  unsigned long epochTime = timeClient.getEpochTime();
+  unsigned long sevenDaysAgo = epochTime - (7UL * 24UL * 3600UL);
 
-// }
+  File root = SD.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    String filename = file.name();
+    if (filename.endsWith(".csv") && filename.length() == 14) {
+      String dateStr = filename.substring(1, 11);
+      int year = dateStr.substring(0, 4).toInt();
+      int month = dateStr.substring(5, 7).toInt();
+      int day = dateStr.substring(8, 10).toInt();
 
-void led(){
-  // Inversion de l'état de la LED
-  if (ledState == HIGH) {
-    digitalWrite(LED_PIN, LOW);  // Éteindre la LED
-    ledState = LOW;  // Met à jour l'état de la LED à éteint
-    Serial.println("LED éteinte");
-  } else {
-    digitalWrite(LED_PIN, HIGH);  // Allumer la LED
-    ledState = HIGH;  // Met à jour l'état de la LED à allumé
-    Serial.println("LED allumée");
+      struct tm fileDate = {0};
+      fileDate.tm_year = year - 1900;
+      fileDate.tm_mon = month - 1;
+      fileDate.tm_mday = day;
+      time_t fileTime = mktime(&fileDate);
+
+      if ((unsigned long)fileTime < sevenDaysAgo) {
+        Serial.println("Suppression: " + filename);
+        SD.remove(filename);
+      }
+    }
+    file = root.openNextFile();
   }
+  root.close();
+}
+
+void led() {
+  ledState = !ledState;
+  digitalWrite(LED_PIN, ledState);
+  Serial.printf("LED %s\n", ledState ? "ON" : "OFF");
 }
