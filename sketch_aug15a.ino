@@ -550,8 +550,6 @@ void handleHistoryData() {
   server.send(200, "application/json", response);
 }
 
-// Dans handleRootModern(), remplacer la partie JavaScript par :
-
 void handleRootModern() {
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -614,6 +612,36 @@ void handleRootModern() {
                         <span class="air-detail">CO₂: <span id="co2-value">--</span> ppm</span>
                         <span class="air-detail">TVOC: <span id="tvoc-value">--</span> ppb</span>
                     </div>
+                    <button id="show-ref-btn" class="ref-btn">Références</button>
+                </div>
+            </div>
+
+            <!-- Modal Références qualité de l'air -->
+            <div id="airRefModal" class="modal">
+                <div class="modal-content">
+                    <span class="close" id="closeRefModal">&times;</span>
+                    <h4>Références qualité de l'air</h4>
+                    <table>
+                        <tr>
+                            <th>AQI</th>
+                            <th>Signification</th>
+                        </tr>
+                        <tr><td>1</td><td>Excellent</td></tr>
+                        <tr><td>2</td><td>Bon</td></tr>
+                        <tr><td>3</td><td>Moyen</td></tr>
+                        <tr><td>4</td><td>Mauvais</td></tr>
+                        <tr><td>5</td><td>Très mauvais</td></tr>
+                    </table>
+                    <table>
+                        <tr>
+                            <th>eCO₂ (ppm)</th>
+                            <th>TVOC (ppb)</th>
+                        </tr>
+                        <tr><td>&lt; 800</td><td>&lt; 150</td></tr>
+                        <tr><td>800 - 1200</td><td>150 - 300</td></tr>
+                        <tr><td>1200 - 2000</td><td>300 - 500</td></tr>
+                        <tr><td>&gt; 2000</td><td>&gt; 500</td></tr>
+                    </table>
                 </div>
             </div>
 
@@ -675,6 +703,27 @@ void handleRootModern() {
     </main>
 
     <script>
+        // Initialisation + gestion du modal références air
+        document.addEventListener('DOMContentLoaded', async function() {
+            // Modal références air
+            const refBtn = document.getElementById('show-ref-btn');
+            const modal = document.getElementById('airRefModal');
+            const closeBtn = document.getElementById('closeRefModal');
+            refBtn.addEventListener('click', () => { modal.style.display = 'block'; });
+            closeBtn.addEventListener('click', () => { modal.style.display = 'none'; });
+            window.addEventListener('click', (event) => {
+                if (event.target == modal) { modal.style.display = 'none'; }
+            });
+
+            // Initialisation des graphiques et données
+            console.log('Initialisation de la page...');
+            initCharts();
+            await loadHistoricalData();
+            await updateCurrentData();
+            setInterval(updateCurrentData, 120000);
+            console.log('Initialisation terminée. Mises à jour programmées toutes les 2 minutes.');
+        });
+
         let tempChart, humChart, airChart;
         let dailyStats = {
             temp: { min: null, max: null },
@@ -1116,25 +1165,6 @@ void handleRootModern() {
             const mins = Math.floor((seconds % 3600) / 60);
             return `${days}j ${hours}h ${mins}m`;
         }
-
-        // Initialisation
-        document.addEventListener('DOMContentLoaded', async function() {
-            console.log('Initialisation de la page...');
-            
-            // Initialiser les graphiques
-            initCharts();
-            
-            // Charger d'abord les données historiques
-            await loadHistoricalData();
-            
-            // Puis faire la première mise à jour des données actuelles
-            await updateCurrentData();
-            
-            // Programmer les mises à jour régulières toutes les 2 minutes (120000 ms)
-            setInterval(updateCurrentData, 120000);
-            
-            console.log('Initialisation terminée. Mises à jour programmées toutes les 2 minutes.');
-        });
     </script>
 </body>
 </html>
@@ -1307,6 +1337,67 @@ main {
     font-size: 1.8rem;
     font-weight: bold;
     color: #2d3748;
+}
+
+// ...dans handleCSS(), à la fin du CSS...
+.ref-btn {
+    margin-top: 1rem;
+    padding: 0.5rem 1.2rem;
+    background: #3182ce;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1rem;
+    transition: background 0.2s;
+}
+.ref-btn:hover {
+    background: #225ea8;
+}
+
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0; top: 0;
+    width: 100%; height: 100%;
+    overflow: auto;
+    background: rgba(0,0,0,0.4);
+}
+.modal-content {
+    background: #fff;
+    margin: 8% auto;
+    padding: 2rem;
+    border-radius: 12px;
+    width: 90%;
+    max-width: 400px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.15);
+    position: relative;
+}
+.modal-content h4 {
+    color: #3182ce;
+    margin-bottom: 1rem;
+}
+.modal-content table {
+    width: 100%;
+    margin-bottom: 0.7rem;
+    border-collapse: collapse;
+}
+.modal-content th, .modal-content td {
+    border: 1px solid #eee;
+    padding: 0.3rem 0.6rem;
+    text-align: center;
+}
+.close {
+    position: absolute;
+    top: 12px;
+    right: 18px;
+    font-size: 2rem;
+    color: #3182ce;
+    cursor: pointer;
+}
+.close:hover {
+    color: #e53e3e;
 }
 
 @media (max-width: 768px) {
