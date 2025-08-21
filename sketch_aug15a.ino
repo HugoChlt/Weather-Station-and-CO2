@@ -1339,20 +1339,24 @@ main {
     color: #2d3748;
 }
 
-// ...dans handleCSS(), à la fin du CSS...
 .ref-btn {
     margin-top: 1rem;
-    padding: 0.5rem 1.2rem;
-    background: #3182ce;
+    padding: 0.6rem 1.6rem;
+    background: linear-gradient(90deg, #3182ce 0%, #764ba2 100%);
     color: #fff;
+    font-weight: 500;
+    font-size: 1.05rem;
     border: none;
-    border-radius: 8px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(49,130,206,0.08);
     cursor: pointer;
-    font-size: 1rem;
-    transition: background 0.2s;
+    transition: background 0.2s, transform 0.2s;
+    letter-spacing: 0.5px;
 }
-.ref-btn:hover {
-    background: #225ea8;
+.ref-btn:hover, .ref-btn:focus {
+    background: linear-gradient(90deg, #225ea8 0%, #4a5568 100%);
+    transform: translateY(-2px) scale(1.04);
+    outline: none;
 }
 
 .modal {
