@@ -89,6 +89,7 @@ bool cacheValid = false;
 // Fonctions serveur web
 void handleRootModern();
 void handleCSS();
+void handleAvailableDates();
 void handleDailyStats();
 void handleHistoryData();
 void handleCurrentDataCached();
@@ -181,7 +182,7 @@ void loop() {
   static unsigned long lastSensorRead = 0;
   unsigned long now = millis();
   
-  if (now - lastSensorRead >= 120000) { // 2 minutes
+  if (now - lastSensorRead >= 240000) { // 2 minutes
     lastSensorRead = now;
     
     // ALLUMER LA LED PENDANT LA RECOLTE
@@ -415,6 +416,7 @@ void init_webserver_enhanced() {
   server.on("/api/daily", HTTP_GET, handleDailyStats);
   server.on("/api/history", HTTP_GET, handleHistoryData);
   server.on("/style.css", HTTP_GET, handleCSS);
+  server.on("/api/dates", HTTP_GET, handleAvailableDates);
   server.onNotFound(handleNotFoundOptimized);
   
   server.begin();
@@ -428,26 +430,26 @@ void handleHistoryData() {
     server.send(503, "application/json", "{\"error\":\"SD card not available\"}");
     return;
   }
+
+  String selectedDate = server.arg("date");
+  String today = catch_time_robust().substring(0, 10);
+  String filename = "/" + (selectedDate.length() == 10 ? selectedDate : today) + ".csv";
   
   String timeRange = server.arg("range");
   if (timeRange == "") timeRange = "24h";
   
-  StaticJsonDocument<4096> doc; // Augmenté pour plus de données
+  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
   JsonArray dataArray = doc.createNestedArray("data");
-  
-  String today = catch_time_robust().substring(0, 10);
-  String filename = "/" + today + ".csv";
-  
+    
   if (SD.exists(filename)) {
     File dataFile = SD.open(filename, FILE_READ);
     if (dataFile) {
       String line;
       bool firstLine = true;
       int pointsCount = 0;
-      int maxPoints = 100; // Augmenté pour avoir plus de points
       
       // Lire ligne par ligne
-      while (dataFile.available() && pointsCount < maxPoints) {
+      while (dataFile.available()) {
         line = dataFile.readStringUntil('\n');
         line.trim();
         
@@ -544,6 +546,7 @@ void handleHistoryData() {
   
   String response;
   serializeJson(doc, response);
+  Serial.println("JSON size: " + String(response.length()));
   
   server.sendHeader("Cache-Control", "public, max-age=30"); // Cache 30 secondes
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -569,6 +572,13 @@ void handleRootModern() {
             <span id="last-update">Jamais</span>
         </div>
     </header>
+
+    <!-- Sélecteur de jour -->
+    <div class="date-selector-bar">
+        <label for="date-selector">Afficher le jour :</label>
+        <input type="date" id="date-selector" />
+        <button id="reset-today-btn" style="display:none;">Retour aujourd'hui</button>
+    </div>
 
     <main>
         <!-- Cartes de données actuelles -->
@@ -633,14 +643,28 @@ void handleRootModern() {
                         <tr><td>5</td><td>Très mauvais</td></tr>
                     </table>
                     <table>
+                        <caption style="caption-side:top;font-weight:bold;">eCO₂/CO₂ (ppm) - Référence</caption>
                         <tr>
-                            <th>eCO₂ (ppm)</th>
-                            <th>TVOC (ppb)</th>
+                            <th>eCO₂/CO₂</th>
+                            <th>Niveau</th>
+                            <th>Suggestion</th>
                         </tr>
-                        <tr><td>&lt; 800</td><td>&lt; 150</td></tr>
-                        <tr><td>800 - 1200</td><td>150 - 300</td></tr>
-                        <tr><td>1200 - 2000</td><td>300 - 500</td></tr>
-                        <tr><td>&gt; 2000</td><td>&gt; 500</td></tr>
+                        <tr><td>21500</td><td>Terrible</td></tr>
+                        <tr><td>1000-1500</td><td>Mauvais</td></tr>
+                        <tr><td>800-1000</td><td>Moyen</td></tr>
+                        <tr><td>600-800</td><td>Bon</td></tr>
+                        <tr><td>400-600</td><td>Excellent</td></tr>
+                    </table>
+                    <table>
+                        <caption style="caption-side:top;font-weight:bold;">TVOC (ppb) - Référence</caption>
+                        <tr>
+                            <th>TVOC</th>
+                            <th>Effets sur la santé</th>
+                        </tr>
+                        <tr><td>&gt;6000</td><td>Maux de tête, problèmes nerveux</td></tr>
+                        <tr><td>750-6000</td><td>Agitation, maux de tête</td></tr>
+                        <tr><td>50-750</td><td>Agitation, inconfort</td></tr>
+                        <tr><td>&lt;50</td><td>Aucun effet</td></tr>
                     </table>
                 </div>
             </div>
@@ -663,16 +687,24 @@ void handleRootModern() {
         <!-- Graphiques -->
         <section class="charts">
             <div class="chart-container">
-                <h3>📈 Température (Aujourd'hui)</h3>
+                <h3>📈 Température</h3>
                 <canvas id="tempChart"></canvas>
             </div>
             <div class="chart-container">
-                <h3>📈 Humidité (Aujourd'hui)</h3>
+                <h3>📈 Humidité</h3>
                 <canvas id="humChart"></canvas>
             </div>
             <div class="chart-container">
-                <h3>📈 Qualité de l'air (Aujourd'hui)</h3>
-                <canvas id="airChart"></canvas>
+                <h3>📈 AQI</h3>
+                <canvas id="aqiChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3>📈 CO₂</h3>
+                <canvas id="co2Chart"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3>📈 TVOC</h3>
+                <canvas id="tvocChart"></canvas>
             </div>
         </section>
 
@@ -703,7 +735,19 @@ void handleRootModern() {
     </main>
 
     <script>
-        // Initialisation + gestion du modal références air
+        let tempChart, humChart, aqiChart, co2Chart, tvocChart;
+        let dailyStats = {
+            temp: { min: null, max: null },
+            hum: { min: null, max: null },
+            eco2: { min: null, max: null },
+            tvoc: { min: null, max: null },
+            aqi: { min: null, max: null }
+        };
+        let historicalDataLoaded = false;
+        let selectedDate = null;
+        let autoUpdateInterval = null;
+        let availableDates = [];
+
         document.addEventListener('DOMContentLoaded', async function() {
             // Modal références air
             const refBtn = document.getElementById('show-ref-btn');
@@ -715,59 +759,70 @@ void handleRootModern() {
                 if (event.target == modal) { modal.style.display = 'none'; }
             });
 
+            // Initialisation du sélecteur de date
+            const dateInput = document.getElementById('date-selector');
+            const resetBtn = document.getElementById('reset-today-btn');
+            const todayStr = new Date().toISOString().slice(0, 10);
+
+            // Récupérer les dates disponibles
+            await fetchAvailableDates();
+            if (availableDates.includes(todayStr)) {
+                dateInput.value = todayStr;
+            } else if (availableDates.length > 0) {
+                dateInput.value = availableDates[availableDates.length - 1];
+            }
+            selectedDate = dateInput.value;
+
+            dateInput.setAttribute('min', availableDates[0] || todayStr);
+            dateInput.setAttribute('max', availableDates[availableDates.length - 1] || todayStr);
+
+            dateInput.addEventListener('change', async function() {
+                selectedDate = dateInput.value;
+                await loadHistoricalData(selectedDate);
+                resetBtn.style.display = (selectedDate !== todayStr) ? 'inline-block' : 'none';
+                if (selectedDate !== todayStr && autoUpdateInterval) {
+                    clearInterval(autoUpdateInterval);
+                    autoUpdateInterval = null;
+                }
+            });
+
+            resetBtn.addEventListener('click', async function() {
+                selectedDate = todayStr;
+                dateInput.value = todayStr;
+                await loadHistoricalData(todayStr);
+                resetBtn.style.display = 'none';
+                if (!autoUpdateInterval) {
+                    autoUpdateInterval = setInterval(updateCurrentData, 240000);
+                }
+                await updateCurrentData();
+            });
+
             // Initialisation des graphiques et données
-            console.log('Initialisation de la page...');
             initCharts();
-            await loadHistoricalData();
+            await loadHistoricalData(selectedDate);
             await updateCurrentData();
-            setInterval(updateCurrentData, 120000);
+            if (selectedDate === todayStr) {
+                autoUpdateInterval = setInterval(updateCurrentData, 240000);
+            }
             console.log('Initialisation terminée. Mises à jour programmées toutes les 2 minutes.');
         });
 
-        let tempChart, humChart, airChart;
-        let dailyStats = {
-            temp: { min: null, max: null },
-            hum: { min: null, max: null },
-            eco2: { min: null, max: null },
-            tvoc: { min: null, max: null },
-            aqi: { min: null, max: null }
-        };
-        let historicalDataLoaded = false;
+        // Récupérer les dates disponibles depuis le serveur
+        async function fetchAvailableDates() {
+            try {
+                const response = await fetch('/api/dates');
+                const result = await response.json();
+                availableDates = result.dates || [];
+            } catch (e) {
+                availableDates = [];
+            }
+        }
 
         // Initialisation des graphiques
         function initCharts() {
-            const chartConfig = {
-                type: 'line',
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { display: true }
-                    },
-                    scales: {
-                        x: { 
-                            display: true,
-                            ticks: {
-                                maxTicksLimit: 12,
-                                callback: function(value, index, values) {
-                                    const label = this.getLabelForValue(value);
-                                    return label.substring(0, 5); // Afficher seulement HH:MM
-                                }
-                            }
-                        },
-                        y: { beginAtZero: false }
-                    },
-                    elements: {
-                        point: { radius: 2 },
-                        line: { tension: 0.2 }
-                    },
-                    animation: false
-                }
-            };
-
-            // Graphique température
+            // Température
             tempChart = new Chart(document.getElementById('tempChart'), {
-                ...chartConfig,
+                type: 'line',
                 data: {
                     labels: [],
                     datasets: [{
@@ -779,23 +834,29 @@ void handleRootModern() {
                     }]
                 },
                 options: {
-                    ...chartConfig.options,
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    elements: {
+                        point: { radius: 0 }
+                    },
                     scales: {
-                        ...chartConfig.options.scales,
+                        x: {
+                            ticks: {
+                                autoSkip: true,
+                                maxTicksLimit: 24 // 1 label par heure
+                            }
+                        },
                         y: {
                             beginAtZero: false,
-                            title: {
-                                display: true,
-                                text: 'Température (°C)'
-                            }
+                            title: { display: true, text: 'Température (°C)' }
                         }
                     }
                 }
             });
 
-            // Graphique humidité
+            // Humidité
             humChart = new Chart(document.getElementById('humChart'), {
-                ...chartConfig,
+                type: 'line',
                 data: {
                     labels: [],
                     datasets: [{
@@ -807,87 +868,130 @@ void handleRootModern() {
                     }]
                 },
                 options: {
-                    ...chartConfig.options,
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    elements: {
+                        point: { radius: 0 }
+                    },
                     scales: {
-                        ...chartConfig.options.scales,
+                        x: {
+                            ticks: {
+                                autoSkip: true,
+                                maxTicksLimit: 24 // 1 label par heure
+                            }
+                        },
                         y: {
                             beginAtZero: true,
                             max: 100,
-                            title: {
-                                display: true,
-                                text: 'Humidité (%)'
-                            }
+                            title: { display: true, text: 'Humidité (%)' }
                         }
                     }
                 }
             });
 
-            // Graphique qualité de l'air (3 métriques)
-            airChart = new Chart(document.getElementById('airChart'), {
-                ...chartConfig,
+            // AQI
+            aqiChart = new Chart(document.getElementById('aqiChart'), {
+                type: 'line',
                 data: {
                     labels: [],
-                    datasets: [
-                        {
-                            label: 'AQI (1-5)',
-                            data: [],
-                            borderColor: '#45b7d1',
-                            backgroundColor: 'rgba(69, 183, 209, 0.1)',
-                            fill: false,
-                            yAxisID: 'y'
-                        },
-                        {
-                            label: 'CO₂ (ppm)',
-                            data: [],
-                            borderColor: '#96CEB4',
-                            backgroundColor: 'rgba(150, 206, 180, 0.1)',
-                            fill: false,
-                            yAxisID: 'y1'
-                        },
-                        {
-                            label: 'TVOC (ppb)',
-                            data: [],
-                            borderColor: '#FFEAA7',
-                            backgroundColor: 'rgba(255, 234, 167, 0.1)',
-                            fill: false,
-                            yAxisID: 'y2'
-                        }
-                    ]
+                    datasets: [{
+                        label: 'AQI (1-5)',
+                        data: [],
+                        borderColor: '#45b7d1',
+                        backgroundColor: 'rgba(69, 183, 209, 0.1)',
+                        fill: true
+                    }]
                 },
                 options: {
-                    ...chartConfig.options,
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    elements: {
+                        point: { radius: 0 }
+                    },
                     scales: {
-                        x: chartConfig.options.scales.x,
-                        y: {
-                            type: 'linear',
-                            display: true,
-                            position: 'left',
-                            min: 1,
-                            max: 5,
-                            title: {
-                                display: true,
-                                text: 'AQI (1-5)'
+                        x: {
+                            ticks: {
+                                autoSkip: true,
+                                maxTicksLimit: 24 // 1 label par heure
                             }
                         },
-                        y1: {
-                            type: 'linear',
-                            display: false,
-                            position: 'right',
+                        y: {
+                            beginAtZero: false,
+                            min: 1,
+                            max: 5,
+                            title: { display: true, text: 'AQI (1-5)' }
+                        }
+                    }
+                }
+            });
+
+            // CO₂
+            co2Chart = new Chart(document.getElementById('co2Chart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'CO₂ (ppm)',
+                        data: [],
+                        borderColor: '#96CEB4',
+                        backgroundColor: 'rgba(150, 206, 180, 0.1)',
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    elements: {
+                        point: { radius: 0 }
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                autoSkip: true,
+                                maxTicksLimit: 24 // 1 label par heure
+                            }
+                        },
+                        y: {
+                            beginAtZero: true,
                             min: 400,
                             max: 2000,
-                            grid: {
-                                drawOnChartArea: false,
-                            },
+                            title: { display: true, text: 'CO₂ (ppm)' }
+                        }
+                    }
+                }
+            });
+
+            // TVOC
+            tvocChart = new Chart(document.getElementById('tvocChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'TVOC (ppb)',
+                        data: [],
+                        borderColor: '#FFEAA7',
+                        backgroundColor: 'rgba(255, 234, 167, 0.1)',
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    elements: {
+                        point: { radius: 0 }
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                autoSkip: true,
+                                maxTicksLimit: 24 // 1 label par heure
+                            }
                         },
-                        y2: {
-                            type: 'linear',
-                            display: false,
-                            position: 'right',
+                        y: {
+                            beginAtZero: true,
                             min: 0,
                             max: 500,
-                            grid: {
-                                drawOnChartArea: false,
-                            },
+                            title: { display: true, text: 'TVOC (ppb)' }
                         }
                     }
                 }
@@ -895,16 +999,17 @@ void handleRootModern() {
         }
 
         // Charger les données historiques du jour
-        async function loadHistoricalData() {
+        async function loadHistoricalData(date = null) {
             try {
                 console.log('Chargement des données historiques...');
-                const response = await fetch('/api/history?range=today');
-                
+                let param = date ? `date=${date}` : 'range=today';
+                const response = await fetch(`/api/history?${param}`);
+                const historyData = await response.json();
+
                 if (!response.ok) {
                     throw new Error(`Erreur HTTP: ${response.status}`);
                 }
                 
-                const historyData = await response.json();
                 console.log('Données reçues:', historyData);
                 
                 if (historyData.data && historyData.data.length > 0) {
@@ -915,10 +1020,12 @@ void handleRootModern() {
                     tempChart.data.datasets[0].data = [];
                     humChart.data.labels = [];
                     humChart.data.datasets[0].data = [];
-                    airChart.data.labels = [];
-                    airChart.data.datasets[0].data = [];
-                    airChart.data.datasets[1].data = [];
-                    airChart.data.datasets[2].data = [];
+                    aqiChart.data.labels = [];
+                    aqiChart.data.datasets[0].data = [];
+                    co2Chart.data.labels = [];
+                    co2Chart.data.datasets[0].data = [];
+                    tvocChart.data.labels = [];
+                    tvocChart.data.datasets[0].data = [];
                     
                     // Ajouter toutes les données historiques
                     historyData.data.forEach(point => {
@@ -927,7 +1034,9 @@ void handleRootModern() {
                         
                         tempChart.data.labels.push(shortTime);
                         humChart.data.labels.push(shortTime);
-                        airChart.data.labels.push(shortTime);
+                        aqiChart.data.labels.push(shortTime);
+                        co2Chart.data.labels.push(shortTime);
+                        tvocChart.data.labels.push(shortTime);
                         
                         // Température
                         if (point.temperature !== undefined && point.temperature !== -999) {
@@ -946,44 +1055,65 @@ void handleRootModern() {
                         }
                         
                         // AQI
-                        if (point.aqi !== undefined && point.aqi !== 0 && point.aqi >= 1 && point.aqi <= 5) {
-                            airChart.data.datasets[0].data.push(point.aqi);
+                        if (point.aqi !== undefined && point.aqi >= 1 && point.aqi <= 5) {
+                            aqiChart.data.datasets[0].data.push(point.aqi);
                             updateMinMax('aqi', point.aqi);
                         } else {
-                            airChart.data.datasets[0].data.push(null);
+                            aqiChart.data.datasets[0].data.push(null);
                         }
                         
                         // CO₂
-                        if (point.eco2 !== undefined && point.eco2 !== 0 && point.eco2 >= 400) {
-                            airChart.data.datasets[1].data.push(point.eco2);
+                        if (point.eco2 !== undefined && point.eco2 >= 400) {
+                            co2Chart.data.datasets[0].data.push(point.eco2);
                             updateMinMax('eco2', point.eco2);
                         } else {
-                            airChart.data.datasets[1].data.push(null);
+                            co2Chart.data.datasets[0].data.push(null);
                         }
                         
                         // TVOC
-                        if (point.tvoc !== undefined && point.tvoc !== 0) {
-                            airChart.data.datasets[2].data.push(point.tvoc);
+                        if (point.tvoc !== undefined) {
+                            tvocChart.data.datasets[0].data.push(point.tvoc);
                             updateMinMax('tvoc', point.tvoc);
                         } else {
-                            airChart.data.datasets[2].data.push(null);
+                            tvocChart.data.datasets[0].data.push(null);
                         }
                     });
                     
                     // Mettre à jour les graphiques
                     tempChart.update('none');
                     humChart.update('none');
-                    airChart.update('none');
+                    aqiChart.update('none');
+                    co2Chart.update('none');
+                    tvocChart.update('none');
+
+                    if (dailyStats.temp.min !== null && dailyStats.temp.max !== null) {
+                        tempChart.options.scales.y.min = dailyStats.temp.min - 1;
+                        tempChart.options.scales.y.max = dailyStats.temp.max + 1;
+                        tempChart.update();
+                    }
+                    if (dailyStats.hum.min !== null && dailyStats.hum.max !== null) {
+                        humChart.options.scales.y.min = Math.max(0, dailyStats.hum.min - 5);
+                        humChart.options.scales.y.max = Math.min(100, dailyStats.hum.max + 5);
+                        humChart.update();
+                    }
+                    if (dailyStats.aqi.min !== null && dailyStats.aqi.max !== null) {
+                        aqiChart.options.scales.y.min = Math.max(1, dailyStats.aqi.min - 0.5);
+                        aqiChart.options.scales.y.max = Math.min(5, dailyStats.aqi.max + 0.5);
+                        aqiChart.update();
+                    }
+                    if (dailyStats.eco2.min !== null && dailyStats.eco2.max !== null) {
+                        co2Chart.options.scales.y.min = Math.max(400, dailyStats.eco2.min - 50);
+                        co2Chart.options.scales.y.max = dailyStats.eco2.max + 100;
+                        co2Chart.update();
+                    }
+                    if (dailyStats.tvoc.min !== null && dailyStats.tvoc.max !== null) {
+                        tvocChart.options.scales.y.min = Math.max(0, dailyStats.tvoc.min - 20);
+                        tvocChart.options.scales.y.max = dailyStats.tvoc.max + 50;
+                        tvocChart.update();
+                    }
                     
                     historicalDataLoaded = true;
                     console.log('Données historiques chargées avec succès');
-                    
-                    // Afficher les min/max de qualité d'air
-                    console.log('Stats qualité air:', {
-                        aqi: dailyStats.aqi,
-                        eco2: dailyStats.eco2,
-                        tvoc: dailyStats.tvoc
-                    });
                     
                 } else {
                     console.log('Aucune donnée historique disponible:', historyData);
@@ -1079,7 +1209,9 @@ void handleRootModern() {
             // Ajouter le nouveau point
             tempChart.data.labels.push(currentTime);
             humChart.data.labels.push(currentTime);
-            airChart.data.labels.push(currentTime);
+            aqiChart.data.labels.push(currentTime);
+            co2Chart.data.labels.push(currentTime);
+            tvocChart.data.labels.push(currentTime);
             
             // Température et humidité
             if (sensors.dht22 && sensors.dht22.status === 'OK') {
@@ -1095,32 +1227,40 @@ void handleRootModern() {
             
             // Qualité de l'air
             if (sensors.ens160 && sensors.ens160.status === 'OK') {
-                airChart.data.datasets[0].data.push(sensors.ens160.aqi); // AQI
-                airChart.data.datasets[1].data.push(sensors.ens160.eco2); // CO₂
-                airChart.data.datasets[2].data.push(sensors.ens160.tvoc); // TVOC
+                aqiChart.data.datasets[0].data.push(sensors.ens160.aqi);
+                co2Chart.data.datasets[0].data.push(sensors.ens160.eco2);
+                tvocChart.data.datasets[0].data.push(sensors.ens160.tvoc);
             } else {
-                airChart.data.datasets[0].data.push(null);
-                airChart.data.datasets[1].data.push(null);
-                airChart.data.datasets[2].data.push(null);
+                aqiChart.data.datasets[0].data.push(null);
+                co2Chart.data.datasets[0].data.push(null);
+                tvocChart.data.datasets[0].data.push(null);
             }
-            
-            // Limiter le nombre de points affichés (garder les 120 derniers points)
-            const maxPoints = 120;
-            if (tempChart.data.labels.length > maxPoints) {
-                tempChart.data.labels.shift();
-                tempChart.data.datasets[0].data.shift();
-                humChart.data.labels.shift();
-                humChart.data.datasets[0].data.shift();
-                airChart.data.labels.shift();
-                airChart.data.datasets[0].data.shift();
-                airChart.data.datasets[1].data.shift();
-                airChart.data.datasets[2].data.shift();
+
+            if (dailyStats.temp.min !== null && dailyStats.temp.max !== null) {
+                tempChart.options.scales.y.min = dailyStats.temp.min - 1;
+                tempChart.options.scales.y.max = dailyStats.temp.max + 1;
+                tempChart.update();
             }
-            
-            // Mettre à jour les graphiques
-            tempChart.update('none');
-            humChart.update('none');
-            airChart.update('none');
+            if (dailyStats.hum.min !== null && dailyStats.hum.max !== null) {
+                humChart.options.scales.y.min = Math.max(0, dailyStats.hum.min - 5);
+                humChart.options.scales.y.max = Math.min(100, dailyStats.hum.max + 5);
+                humChart.update();
+            }
+            if (dailyStats.aqi.min !== null && dailyStats.aqi.max !== null) {
+                aqiChart.options.scales.y.min = Math.max(1, dailyStats.aqi.min - 0.5);
+                aqiChart.options.scales.y.max = Math.min(5, dailyStats.aqi.max + 0.5);
+                aqiChart.update();
+            }
+            if (dailyStats.eco2.min !== null && dailyStats.eco2.max !== null) {
+                co2Chart.options.scales.y.min = Math.max(400, dailyStats.eco2.min - 50);
+                co2Chart.options.scales.y.max = dailyStats.eco2.max + 100;
+                co2Chart.update();
+            }
+            if (dailyStats.tvoc.min !== null && dailyStats.tvoc.max !== null) {
+                tvocChart.options.scales.y.min = Math.max(0, dailyStats.tvoc.min - 20);
+                tvocChart.options.scales.y.max = dailyStats.tvoc.max + 50;
+                tvocChart.update();
+            }
         }
 
         function updateMinMax(type, value) {
@@ -1171,6 +1311,35 @@ void handleRootModern() {
 )rawliteral";
   
   server.send(200, "text/html", html);
+}
+
+void handleAvailableDates() {
+  if (!sdCardInitialized) {
+    server.send(503, "application/json", "{\"error\":\"SD card not available\"}");
+    return;
+  }
+  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
+  JsonArray dates = doc.createNestedArray("dates");
+
+  File root = SD.open("/");
+  if (root) {
+    File file = root.openNextFile();
+    while (file) {
+      String filename = file.name();
+      if (filename.endsWith(".csv") && filename.length() >= 14) {
+        String dateStr = extractDateFromFilename(filename);
+        if (isValidDateFormat(dateStr)) {
+          dates.add(dateStr);
+        }
+      }
+      file.close();
+      file = root.openNextFile();
+    }
+    root.close();
+  }
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
 }
 
 void handleCSS() {
@@ -1272,7 +1441,7 @@ main {
 
 .charts {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+    grid-template-columns: 1fr; /* 1 colonne = 1 graphique par ligne */
     gap: 2rem;
     margin-bottom: 3rem;
 }
@@ -1404,6 +1573,36 @@ main {
     color: #e53e3e;
 }
 
+.date-selector-bar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    background: rgba(255,255,255,0.95);
+    padding: 1rem 2rem;
+    margin-bottom: 1.5rem;
+    border-radius: 12px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.07);
+}
+.date-selector-bar label {
+    font-weight: 500;
+    color: #3182ce;
+}
+#date-selector {
+    font-size: 1rem;
+    padding: 0.3rem 0.7rem;
+    border-radius: 8px;
+    border: 1px solid #ccc;
+}
+#reset-today-btn {
+    padding: 0.3rem 1rem;
+    border-radius: 8px;
+    border: none;
+    background: #3182ce;
+    color: #fff;
+    font-weight: 500;
+    cursor: pointer;
+}
+
 @media (max-width: 768px) {
     .current-data {
         grid-template-columns: 1fr;
@@ -1439,8 +1638,8 @@ void handleDailyStats() {
   
   String today = catch_time_robust().substring(0, 10);
   String filename = "/" + today + ".csv";
-  
-  StaticJsonDocument<1024> doc;
+
+  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
   doc["date"] = today;
   
   if (SD.exists(filename)) {
@@ -1555,7 +1754,7 @@ void handleCurrentDataCached() {
 }
 
 String buildOptimizedJSON(const SensorData& data) {
-  StaticJsonDocument<JSON_BUFFER_SIZE> doc;
+  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
   
   doc["timestamp"] = data.date + " " + data.time;
   doc["uptime"] = millis() / 1000;
@@ -1602,7 +1801,7 @@ String buildOptimizedJSON(const SensorData& data) {
 }
 
 void handleHealthCheck() {
-  StaticJsonDocument<STATS_JSON_BUFFER_SIZE> doc;
+  DynamicJsonDocument doc(STATS_JSON_BUFFER_SIZE);
   doc["status"] = "OK";
   doc["wifi"] = wifiConnected;
   doc["uptime"] = millis() / 1000;
@@ -1626,8 +1825,8 @@ void handleStatsCached() {
     server.send(200, "application/json", apiStatsCache.data);
     return;
   }
-  
-  StaticJsonDocument<STATS_JSON_BUFFER_SIZE> doc;
+
+  DynamicJsonDocument doc(STATS_JSON_BUFFER_SIZE);
   doc["total_readings"] = totalReadingsCount;
   doc["valid_readings"] = validReadingsCount;
   doc["success_rate"] = totalReadingsCount > 0 ? (float)validReadingsCount / totalReadingsCount * 100 : 0;
@@ -1664,8 +1863,8 @@ void handleFileListOptimized() {
     server.send(503, "application/json", "{\"error\":\"SD card not available\"}");
     return;
   }
-  
-  StaticJsonDocument<1024> doc;
+
+  DynamicJsonDocument doc(1024);
   JsonArray files = doc.createNestedArray("files");
   
   File root = SD.open("/");
@@ -1693,7 +1892,7 @@ void handleFavicon() {
 }
 
 void handleNotFoundOptimized() {
-  StaticJsonDocument<128> doc;
+  DynamicJsonDocument doc(128);
   doc["error"] = "Endpoint not found";
   doc["available_endpoints"] = JsonArray();
   doc["available_endpoints"].add("/api/current");
