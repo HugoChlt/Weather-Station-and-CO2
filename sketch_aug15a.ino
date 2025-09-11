@@ -9,6 +9,7 @@
 #include <ScioSense_ENS160.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
 
@@ -103,6 +104,8 @@ void handleRootOptimized();
 // Fonctions utilitaires serveur
 String buildOptimizedJSON(const SensorData& data);
 
+void initWatchdog();
+
 // Fonctions WiFi
 void init_wifi_enhanced();
 void connect_wifi_enhanced();
@@ -139,8 +142,12 @@ void init_dht();
 float catch_temp();
 float catch_hum();
 
+bool watchdogInitialized = false;
+
 void setup() {
   Serial.begin(115200);
+  initWatchdog();
+  esp_task_wdt_reset();
   delay(2000);
   
   Serial.println("=== DEMARRAGE ESP32 STATION METEO V3 ===");
@@ -162,91 +169,125 @@ void setup() {
 // Remplacer la fonction loop() par :
 
 void loop() {
-  unsigned long startTime = millis();
-  
-  // Gestion WiFi haute fréquence
-  manage_wifi_connection_enhanced();
-  
-  // Gérer requêtes web avec monitoring
-  if (wifiConnected && webServerStarted) {
-    unsigned long webStart = millis();
-    server.handleClient();
-    
-    unsigned long webTime = millis() - webStart;
-    if (webTime > DEBUG_WEB_REQUEST_WARNING_MS) {
-      Serial.printf("Requete web lente: %lu ms\n", webTime);
-    }
+  if (ESP.getFreeHeap() < 20000) { // 20kB
+    Serial.println("Memoire critique, redemarrage...");
+    ESP.restart();
   }
+  static unsigned long lastLoopDelay = 0;
+  if (millis() - lastLoopDelay >= 1000 * TIME_SCALE) {
+    lastLoopDelay = millis();
+    unsigned long startTime = millis();
 
-  // Lecture capteurs - OPTIMISATION : toutes les 2 minutes (120000 ms)
-  static unsigned long lastSensorRead = 0;
-  unsigned long now = millis();
-  
-  if (now - lastSensorRead >= 240000) { // 2 minutes
-    lastSensorRead = now;
+    esp_task_wdt_reset();
     
-    // ALLUMER LA LED PENDANT LA RECOLTE
-    digitalWrite(LED_PIN, HIGH);
-    Serial.println("=== DEBUT LECTURE CAPTEURS ===");
+    // Gestion WiFi haute fréquence
+    manage_wifi_connection_enhanced();
     
-    SensorData datas;
-    String fullTime = catch_time_robust();
-    datas.date = fullTime.substring(0, 10);
-    datas.time = fullTime.substring(11);
+    // Gérer requêtes web avec monitoring
+    if (wifiConnected && webServerStarted) {
+      unsigned long webStart = millis();
+      server.handleClient();
+      
+      unsigned long webTime = millis() - webStart;
+      if (webTime > DEBUG_WEB_REQUEST_WARNING_MS) {
+        Serial.printf("Requete web lente: %lu ms\n", webTime);
+      }
+    }
 
-    read_all_sensors_robust(datas);
+    // Lecture capteurs - OPTIMISATION : toutes les 2 minutes (120000 ms)
+    static unsigned long lastSensorRead = 0;
+    unsigned long now = millis();
     
-    // Mettre à jour cache
-    cachedData = datas;
-    lastDataUpdate = millis();
-    cacheValid = true;
-    
-    // Sauvegarde SD uniquement si données valides
-    if (sdCardInitialized && sdHealthy) {
-      save_on_sd_card_robust(datas);
-      clean_old_files_robust();
+    if (now - lastSensorRead >= 240000) { // 2 minutes
+      lastSensorRead = now;
+      
+      // ALLUMER LA LED PENDANT LA RECOLTE
+      digitalWrite(LED_PIN, HIGH);
+      Serial.println("=== DEBUT LECTURE CAPTEURS ===");
+      
+      SensorData datas;
+      String fullTime = catch_time_robust();
+      datas.date = fullTime.substring(0, 10);
+      datas.time = fullTime.substring(11);
+
+      read_all_sensors_robust(datas);
+      
+      // Mettre à jour cache
+      cachedData = datas;
+      lastDataUpdate = millis();
+      cacheValid = true;
+      
+      // Sauvegarde SD uniquement si données valides
+      if (sdCardInitialized && sdHealthy) {
+        save_on_sd_card_robust(datas);
+        clean_old_files_robust();
+      }
+      
+      // ETEINDRE LA LED APRES LA RECOLTE
+      digitalWrite(LED_PIN, LOW);
+      Serial.printf("=== FIN LECTURE CAPTEURS (duree: %lu ms) ===\n", millis() - now);
     }
     
-    // ETEINDRE LA LED APRES LA RECOLTE
-    digitalWrite(LED_PIN, LOW);
-    Serial.printf("=== FIN LECTURE CAPTEURS (duree: %lu ms) ===\n", millis() - now);
-  }
-  
-  // Monitoring I2C et SD - encore moins fréquent (toutes les 10 minutes)
-  static unsigned long lastMonitoring = 0;
-  if (now - lastMonitoring >= 600000) { // 10 minutes
-    lastMonitoring = now;
-    monitor_i2c_health_enhanced();
-    monitor_sd_space();
-  }
-  
-  // Performance monitoring
-  unsigned long loopTime = millis() - startTime;
-  if (loopTime > DEBUG_LOOP_TIME_WARNING_MS) {
-    Serial.printf("Loop lente: %lu ms\n", loopTime);
-  }
-  
-  // Monitoring mémoire périodique (toutes les 5 minutes)
-  static unsigned long lastMemoryCheck = 0;
-  if (now - lastMemoryCheck >= 300000) { // 5 minutes
-    lastMemoryCheck = now;
-    Serial.printf("Memoire libre: %u octets\n", ESP.getFreeHeap());
-    
-    // Afficher infos temps
-    if (timeInitialized) {
-      Serial.printf("Derniere sync NTP: %lu ms ago\n", millis() - lastNTPSync);
+    // Monitoring I2C et SD - encore moins fréquent (toutes les 10 minutes)
+    static unsigned long lastMonitoring = 0;
+    if (now - lastMonitoring >= 600000) { // 10 minutes
+      lastMonitoring = now;
+      monitor_i2c_health_enhanced();
+      monitor_sd_space();
     }
     
-    // Afficher statistiques capteurs
-    if (totalReadingsCount > 0) {
-      float successRate = (float)validReadingsCount / totalReadingsCount * 100;
-      Serial.printf("Statistiques: %d lectures, %.1f%% succes\n", 
-                   totalReadingsCount, successRate);
+    // Performance monitoring
+    unsigned long loopTime = millis() - startTime;
+    if (loopTime > DEBUG_LOOP_TIME_WARNING_MS) {
+      Serial.printf("Loop lente: %lu ms\n", loopTime);
+    }
+    
+    // Monitoring mémoire périodique (toutes les 5 minutes)
+    static unsigned long lastMemoryCheck = 0;
+    if (now - lastMemoryCheck >= 300000) { // 5 minutes
+      lastMemoryCheck = now;
+      Serial.printf("Memoire libre: %u octets\n", ESP.getFreeHeap());
+      
+      // Afficher infos temps
+      if (timeInitialized) {
+        Serial.printf("Derniere sync NTP: %lu ms ago\n", millis() - lastNTPSync);
+      }
+      
+      // Afficher statistiques capteurs
+      if (totalReadingsCount > 0) {
+        float successRate = (float)validReadingsCount / totalReadingsCount * 100;
+        Serial.printf("Statistiques: %d lectures, %.1f%% succes\n", 
+                    totalReadingsCount, successRate);
+      }
     }
   }
-  
-  delay(1000 * TIME_SCALE); // Boucle toutes les secondes
+  delay(200);
 }
+
+void initWatchdog() {
+  Serial.println("=== INITIALISATION WATCHDOG ===");
+
+  if (!watchdogInitialized) {
+    esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = WATCHDOG_TIMEOUT_MS,
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, // surveiller tous les cores
+      .trigger_panic = true                            // reset en cas de blocage
+    };
+
+    esp_err_t err = esp_task_wdt_init(&wdt_config);
+    if (err == ESP_ERR_INVALID_STATE) {
+      Serial.println("Watchdog déjà initialisé, on réutilise l’instance existante.");
+    } else {
+      ESP_ERROR_CHECK(err);
+    }
+
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));  // ajoute la loop courante au WDT
+    watchdogInitialized = true;
+  }
+
+  Serial.printf("Watchdog configuré: timeout %d ms\n", WATCHDOG_TIMEOUT_MS);
+}
+
 
 // ===== WIFI ULTRA-ROBUSTE =====
 
@@ -266,6 +307,7 @@ void connect_wifi_enhanced() {
   Serial.printf("Connexion WiFi a %s...\n", ssid);
   
   WiFi.disconnect(true);
+  esp_task_wdt_reset();
   delay(1000);
   WiFi.begin(ssid, password);
   
@@ -289,6 +331,7 @@ void connect_wifi_enhanced() {
       if (status == WL_CONNECT_FAILED || status == WL_CONNECTION_LOST) {
         Serial.println(" - Redemarrage WiFi...");
         WiFi.disconnect();
+        esp_task_wdt_reset();
         delay(2000);
         WiFi.begin(ssid, password);
       }
@@ -348,6 +391,7 @@ void manage_wifi_connection_enhanced() {
       if (consecutiveFailures > 3 && (now - lastSuccessfulConnection > WIFI_TIMEOUT_MS * 10)) {
         Serial.println("Force reconnexion (instabilite detectee)");
         WiFi.disconnect();
+        esp_task_wdt_reset();
         delay(1000);
         connect_wifi_enhanced();
       }
@@ -1949,11 +1993,19 @@ void read_all_sensors_robust(SensorData &datas) {
           break;
         } else {
           Serial.printf("AHT21 valeurs aberrantes: T=%.2f, H=%.1f (retry %d)\n", temp, hum, retry);
-          if (retry == 0) delay(500);
+          if (retry == 0) 
+          {
+            esp_task_wdt_reset();
+            delay(500);
+          }
         }
       } else {
         Serial.printf("AHT21 echec communication (retry %d)\n", retry);
-        if (retry == 0) delay(500);
+        if (retry == 0) 
+        {
+          esp_task_wdt_reset();
+          delay(500);
+        }
       }
     }
     
@@ -1999,12 +2051,17 @@ void read_all_sensors_robust(SensorData &datas) {
         } else {
           Serial.printf("ENS160 valeurs aberrantes: eCO2=%u, TVOC=%u, AQI=%u (retry %d)\n", 
                        eco2, tvoc, aqi, retry);
-          if (retry == 0) delay(500);
+          if (retry == 0){
+            esp_task_wdt_reset();
+            delay(500);
+          }
         }
       } else {
         Serial.printf("ENS160 non disponible (retry %d)\n", retry);
-        if (retry == 0) delay(500);
-      }
+          if (retry == 0){
+            esp_task_wdt_reset();
+            delay(500);
+          }      }
     }
     
     if (!datas.validENS160) {
@@ -2047,8 +2104,10 @@ void monitor_i2c_health_enhanced() {
       Serial.printf("I2C instable (%d erreurs), reset complet...\n", i2cErrorCount);
       
       Wire.end();
+      esp_task_wdt_reset();
       delay(1000);
       init_i2c();
+      esp_task_wdt_reset();
       delay(2000);
       
       init_sensors_robust();
@@ -2065,45 +2124,57 @@ void scan_i2c_enhanced() {
   Serial.println("Scan I2C detaille...");
   int deviceCount = 0;
   bool currentDevices[128] = {false};
-  
+
   for (byte address = 1; address < 127; address++) {
     Wire.beginTransmission(address);
     byte error = Wire.endTransmission();
-    
+
     if (error == 0) {
       currentDevices[address] = true;
       deviceCount++;
-      
       String deviceName = "Inconnu";
       if (address == 0x38) deviceName = "AHT21";
       else if (address == 0x53) deviceName = "ENS160";
-      
       if (!i2cDevicesDetected[address]) {
         Serial.printf("Nouveau device: 0x%02X (%s)\n", address, deviceName.c_str());
       }
-      
       Serial.printf("Device 0x%02X (%s) - OK\n", address, deviceName.c_str());
     } else {
       if (i2cDevicesDetected[address]) {
         Serial.printf("Device perdu: 0x%02X\n", address);
       }
     }
-    
+    esp_task_wdt_reset();
     delay(10);
   }
-  
+
   memcpy(i2cDevicesDetected, currentDevices, sizeof(currentDevices));
-  
   Serial.printf("Scan termine: %d device(s) trouve(s)\n", deviceCount);
-  
-  // Vérifier capteurs critiques
+
+  // Vérifier capteurs critiques et réinitialiser si perdus
   if (!currentDevices[0x38] && ahtInitialized) {
-    Serial.println("AHT21 deconnecte !");
+    Serial.println("AHT21 deconnecte ! Reset I2C et capteur...");
     ahtInitialized = false;
+    Wire.end();
+    esp_task_wdt_reset();
+    delay(100);
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(I2C_FREQUENCY);
+    esp_task_wdt_reset();
+    delay(500);
+    init_sensors_robust();
   }
   if (!currentDevices[0x53] && ens160Initialized) {
-    Serial.println("ENS160 deconnecte !");
+    Serial.println("ENS160 deconnecte ! Reset I2C et capteur...");
     ens160Initialized = false;
+    Wire.end();
+    esp_task_wdt_reset();
+    delay(100);
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(I2C_FREQUENCY);
+    esp_task_wdt_reset();
+    delay(500);
+    init_sensors_robust();
   }
 }
 
@@ -2134,6 +2205,7 @@ void init_sd_card_robust() {
       return;
     } else {
       Serial.printf("Tentative SD %d/3 echouee\n", attempt + 1);
+      esp_task_wdt_reset();
       delay(1000);
     }
   }
@@ -2158,21 +2230,26 @@ bool test_sd_write() {
 
 void save_on_sd_card_robust(const SensorData& datas) {
   if (!sdCardInitialized || !sdHealthy) return;
-  
   if (!datas.validDHT && !datas.validAHT && !datas.validENS160) {
     Serial.println("Aucune donnee valide - pas de sauvegarde");
     return;
   }
-  
   String filename = "/" + datas.date + ".csv";
   bool newFile = !SD.exists(filename);
 
-  File dataFile = SD.open(filename, FILE_APPEND);
+  File dataFile;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    dataFile = SD.open(filename, FILE_APPEND);
+    if (dataFile) break;
+    Serial.printf("Erreur ouverture fichier SD (tentative %d)\n", attempt + 1);
+    esp_task_wdt_reset();
+    delay(500);
+  }
+
   if (dataFile) {
     if (newFile) {
       dataFile.println("Date,Heure,Temp_DHT22,Hum_DHT22,Temp_AHT21,Hum_AHT21,eCO2_ppm,TVOC_ppb,AQI,Status_DHT,Status_AHT,Status_ENS,WiFi_RSSI,Free_Heap");
     }
-    
     dataFile.printf("%s,%s,%.2f,%.1f,%.2f,%.1f,%u,%u,%u,%s,%s,%s,%d,%u\n",
                     datas.date.c_str(),
                     datas.time.c_str(),
@@ -2188,34 +2265,34 @@ void save_on_sd_card_robust(const SensorData& datas) {
                     datas.validENS160 ? "OK" : "ERR",
                     WiFi.RSSI(),
                     ESP.getFreeHeap());
-    
     dataFile.close();
     Serial.printf("Sauvegarde dans %s\n", filename.c_str());
-    
   } else {
-    Serial.println("Erreur ouverture fichier SD");
+    Serial.println("Erreur ouverture fichier SD definitive");
     sdHealthy = false;
+    ESP.restart();
   }
 }
 
 void monitor_sd_space() {
   unsigned long now = millis();
-  
   if (now - sdLastCheck > SD_SPACE_CHECK_INTERVAL_MS) {
     sdLastCheck = now;
-    
     uint64_t newUsedSpace = SD.usedBytes() / (1024 * 1024);
     float usagePercent = (float)newUsedSpace / sdTotalSpace * 100;
-    
-    Serial.printf("Espace SD: %lluMB/%lluMB (%.1f%%)\n", 
-                 newUsedSpace, sdTotalSpace, usagePercent);
-    
+    Serial.printf("Espace SD: %lluMB/%lluMB (%.1f%%)\n", newUsedSpace, sdTotalSpace, usagePercent);
     if (usagePercent > SD_CRITICAL_SPACE_PERCENT) {
       Serial.println("Espace SD critique ! Nettoyage force...");
       force_cleanup_sd();
+      esp_task_wdt_reset();
+      delay(500);
     }
-    
     sdUsedSpace = newUsedSpace;
+    if (!test_sd_write()) {
+      Serial.println("Test ecriture SD echoue - redemarrage...");
+      sdHealthy = false;
+      ESP.restart();
+    }
   }
 }
 
@@ -2245,6 +2322,7 @@ void perform_cleanup(int daysToKeep) {
   if (!timeClient.update()) {
     for (int i = 0; i < 3; i++) {
       if (timeClient.forceUpdate()) break;
+      esp_task_wdt_reset();
       delay(1000);
     }
   }
@@ -2391,6 +2469,7 @@ String catch_time_robust() {
       
       // Si échec et pas encore initialisé, essayer une fois de plus
       if (!timeInitialized) {
+        esp_task_wdt_reset();
         delay(500);
         if (timeClient.forceUpdate()) {
           lastNTPSync = now;
@@ -2452,6 +2531,7 @@ void init_i2c() {
   }
   
   Wire.setClock(I2C_FREQUENCY);
+  esp_task_wdt_reset();
   delay(500);
   Serial.printf("I2C initialise (%d Hz)\n", I2C_FREQUENCY);
 }
@@ -2459,6 +2539,7 @@ void init_i2c() {
 void init_dht() {
   Serial.println("Initialisation DHT22...");
   dht.begin();
+  esp_task_wdt_reset();
   delay(DHT_READ_DELAY_MS);
   
   float test_temp = dht.readTemperature();
@@ -2484,12 +2565,15 @@ void init_sensors_robust() {
       break;
     } else {
       Serial.printf("Tentative AHT21 %d/3 echouee\n", attempt + 1);
+      esp_task_wdt_reset();
       delay(1000);
       if (attempt < 2) {
         Wire.end();
+        esp_task_wdt_reset();
         delay(500);
         Wire.begin(SDA_PIN, SCL_PIN);
         Wire.setClock(I2C_FREQUENCY);
+        esp_task_wdt_reset();
         delay(500);
       }
     }
@@ -2499,6 +2583,7 @@ void init_sensors_robust() {
     Serial.println("AHT21 non detecte");
   }
   
+  esp_task_wdt_reset();
   delay(1000);
   
   // ENS160 avec retry
@@ -2520,6 +2605,7 @@ void init_sensors_robust() {
       break;
     } else {
       Serial.printf("Tentative ENS160 %d/3 echouee\n", attempt + 1);
+      esp_task_wdt_reset();
       delay(1000);
     }
   }
